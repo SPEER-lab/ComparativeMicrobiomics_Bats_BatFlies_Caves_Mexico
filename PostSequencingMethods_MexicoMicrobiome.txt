@@ -1,0 +1,450 @@
+#NOTE: All data saved to external hard drive
+#(Tutorial - https://docs.qiime2.org/2018.2/tutorials/moving-pictures/#featuretable-and-featuredata-summaries)
+
+#Sequences are formatted as a parent directory with
+#subdirectories for each sample. Each subdirectory contains two fastq.gz files.
+#
+#All raw reads stored on Cuvier in array1 as .fastq.gz 
+#
+#Navigate to compressed directory on cluster
+#
+#####ACTIVATE QIIME2####
+#The below is to activate version 2019.1
+#To activate the QIIME2 environment and enable tab completion:
+
+source activate qiime2-2019.1
+source tab-qiime
+
+#To deactivate the QIIME2 environment:
+
+source deactivate
+
+####IMPORT DATA TO QIIME2####
+#Import Data into QIIME2:
+#Create sample manifest because sample names are sometimes numbers and sometimes letters
+#https://docs.qiime2.org/2019.1/tutorials/importing/#sequence-data-with-sequence-quality-information-i-e-fastq
+
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path /home/kspeer/array1/MexicoMicrobiomeData/Raw16S_MexicoMicrobiome/samplemanifest.csv \
+  --output-path /home/kspeer/array1/MexicoMicrobiomeData/Mexico_16S_PE_demux.qza \
+  --input-format PairedEndFastqManifestPhred33
+
+#Summarize Demultiplexed Data:
+qiime demux summarize \
+  --i-data Mexico_16S_PE_demux.qza \
+  --o-visualization Mexico_16S_PE_demux.qzv
+
+####VIZUALIZE DATA IN QIIME2 VIEW####
+#Download deumux-paired-end.qzv from cluster:
+#View in QIIME2 View (https://view.qiime2.org/)
+
+#Find the values for --p-trim-left m (m bases you want to cut off the left side of the
+#sequence) and --p-trunc-len n (n position at which the sequence is truncated), which are needed
+#as input for DADA2 (Follow instructions in https://docs.qiime2.org/2018.2/tutorials/atacama-soils/).
+#Generally, you want your read lengths to be long enough that the forward and reverse reads
+#overlap, but you want to eliminate low quality bases.
+
+####DENOISE DATA IN DADA2####
+#Denoise data in Dada2 using the below parameters (truncation chosen because avg. above 15):
+#Denoise was done on Cuvier using a qsub script titled Dada2script.sh. It took ~24 hours using
+#ncpu = 15 and mem=36gb.
+
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs Mexico_16S_PE_demux.qza \
+  --p-trim-left-f 0 \
+  --p-trim-left-r 0 \
+  --p-trunc-len-f 180 \
+  --p-trunc-len-r 150 \
+  --o-table table.qza \
+  --o-representative-sequences rep-seqs.qza \
+  --o-denoising-stats denoising-stats.qza
+
+####VISUALIZE RESULTS OF DENOISE STEP####
+#Create Metadata file (https://docs.qiime2.org/2019.1/tutorials/metadata/) and validate using 
+#Keemei, an add-on in google sheets (https://keemei.qiime2.org/). Export the Metadata file as a .tsv
+#file and then use scp to transfer to cuvier
+
+#Summarize the output feature table to explore the results of the filtering step for the relaxed and strict trims:
+qiime feature-table summarize \
+  --i-table table.qza \
+  --o-visualization table.qzv \
+  --m-sample-metadata-file Metadata_Mexico.tsv
+
+qiime feature-table tabulate-seqs \
+  --i-data rep-seqs.qza \
+  --o-visualization rep-seqs.qzv
+
+#Download all qzv files for viewing in QIIME2View (https://view.qiime2.org/):
+
+#The trim resulted in 7 samples with 0 reads and 6 samples with fewer than 1000 reads (178 remaining samples)
+#There were 14,706 features.
+#The extraction (-) had 11,954 reads
+#The PCR (-) had 738 reads and the Index (-) had 0
+#The Community positive had 1,670 reads and the DNA positive had 1,634 reads
+
+####ID SEQUENCE VARIANTS IN PCR(-) AND EXT(-)####
+#https://docs.qiime2.org/2019.1/tutorials/feature-classifier/
+#Download the Silva_132_release database and upload it to cuvier
+#Import the database to QIIME2
+
+qiime tools import \
+  --type 'FeatureData[Sequence]' \
+  --input-path /home/kspeer/array1/MexicoMicrobiomeData/Mexico_QIIME2/SILVA_132_QIIME_release/rep_set/rep_set_16S_only/99/silva_132_99_16S.fna \
+  --output-path silva_seqs.qza
+
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-format HeaderlessTSVTaxonomyFormat \
+  --input-path /home/kspeer/array1/MexicoMicrobiomeData/Mexico_QIIME2/SILVA_132_QIIME_release/taxonomy/16S_only/99/taxonomy_7_levels.txt \
+  --output-path silva_taxonomy.qza
+
+#Extract the reads in the database using the primer sites and set p-min-length and p-max-length so that non-target reads are eliminated
+
+qiime feature-classifier extract-reads \
+  --i-sequences silva_seqs.qza \
+  --p-f-primer GTGCCAGCMGCCGCGGTAA \
+  --p-r-primer GGACTACHVGGGTWTCTAAT \
+  --p-min-length 100 \
+  --p-max-length 400 \
+  --o-reads ref-seqs.qza
+
+#Train the classifier - for this you need to use a submission script
+
+qiime feature-classifier fit-classifier-naive-bayes \
+  --i-reference-reads ref-seqs.qza \
+  --i-reference-taxonomy silva_taxonomy.qza \
+  --o-classifier classifier.qza
+
+# Within the same submission script, issue the following command to 
+#Use the classifier to identify reads in your samples
+
+qiime feature-classifier classify-sklearn \
+  --i-classifier classifier.qza \
+  --i-reads rep-seqs.qza \
+  --o-classification taxonomy.qza
+
+#Summarize the results of the taxonomic assignments for visualization in QIIME 2 View
+#There is an issue with extra spaces in the taxonomy.qza file, so we have to first convert the
+#file to a .tsv and then to a .qzv and back to a .qza and import it to QIIME2 for downstream use
+
+qiime tools export \
+  --input-path taxonomy.qza \
+  --output-path taxonomy
+
+qiime metadata tabulate \
+  --m-input-file taxonomy.tsv \
+  --o-visualization taxonomy.qzv
+
+qiime tools export \
+  --input-path taxonomy.qzv \
+  --output-path taxonomy_NoSpaces
+
+qiime tools import \
+  --type 'FeatureData[Taxonomy]' \
+  --input-path taxonomy_NoSpaces/metadata.tsv \
+  --output-path taxonomy_NoSpaces.qza
+
+#To view interactive bar plots of the data:
+
+qiime taxa barplot \
+  --i-table table.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --m-metadata-file Metadata_Mexico.tsv \
+  --o-visualization taxa-bar-plots_unfiltered.qzv
+
+#Bar plots reveal several sequence variants in the Ext(-) and PCR(-), but the index(-) has no variants.
+#Due to the cross-indexing issues known from illumina sequencing, it is not a good idea to eliminate all OTUs found in a (-). Some of these
+#are likely just the result of of cross-indexing of the most abundant OTUs. Download CSV of taxonomic IDs at Level-6 (genus-level).
+
+####FILTER DATA####
+#https://docs.qiime2.org/2019.1/tutorials/filtering/
+#The PCR- and Ext- samples each retained some sequence variants. To eliminate these, we use the filter tools in QIIME 2(https://docs.qiime2.org/2018.2/tutorials/filtering/)
+#Some taxa can be eliminated using the --p-mode contains (default) setting, because they have a unique
+#enough identifier that they will not incorrectly eliminate non-target taxa if we exclude them by targeting only a small
+#portion of their taxon ID. 
+#BA24 is not a negative control.
+#First, we will filter all OTUs found in the negative controls and filter out known contaminants based on previous publications
+
+##This turned out to be uninformative and do not repeat for future analyses -- Second, we will just filter out the known contaminants and mitochondria, chloroplast, and Archaea and use
+##decontam in R to eliminate taxa found in the negative and positive controls
+
+#First, Eliminate all known contaminants (Eisenhofer et al. 2019; you don't need to check that they are in your data, just remove them if they are there) Citation Eisenhofer et al. 2019
+
+qiime taxa filter-seqs \
+  --i-sequences rep-seqs.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-exclude Actinomyces,Corynebacterium,Arthrobacter,Rothia,Propionibacterium,Atopobium,Sediminibacterium,Porphyromonas,Prevotella,Chryseobacterium,Capnocytophaga,Chryseobacterium,Flavobacterium,Pedobacter,UnclassifiedTM7,Bacillus,Geobacillus,Brevibacillus,Paenibacillus,Staphylococcus,Abiotrophia,Granulicatella,Enterococcus,Lactobacillus,Streptococcus,Clostridium,Coprococcus,Anaerococcus,Dialister,Megasphaera,Veillonella,Fusobacterium,Leptotrichia,Brevundimonas,Afipia,Bradyrhizobium,Devosia,Methylobacterium,Mesorhizobium,Phyllobacterium,Rhizobium,Methylobacterium,Phyllobacterium,Roseomonas,Novosphingobium,Sphingobium,Sphingomonas,Achromobacter,Burkholderia,Acidovorax,Comamonas,Curvibacter,Pelomonas,Cupriavidus,Duganella,Herbaspirillum,Janthinobacterium,Massilia,Oxalobacter,Ralstonia,Leptothrix,kingella,Neisseria,Escherichia,Haemophilus,Acinetobacter,Enhydrobacter,Pseudomonas,Stenotrophomonas,Xanthomonas \
+  --o-filtered-sequences rep-seqs-filtered_knownContam.qza
+
+#Now remove those found in the negative control that aren't due to index bleed (remove those that are in low abundance in the negative, but extremely high abundance elsewhere)
+#including the bacteria genera in the (+) controls
+
+#qiime taxa filter-seqs \
+#  --i-sequences rep-seqs-filtered_knownContam.qza \
+#  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+#  --p-mode exact \
+#  --p-exclude "D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales","D_0__Bacteria;D_1__Acidobacteria;D_2__Blastocatellia (Subgroup 4);D_3__Blastocatellales;D_4__Blastocatellacea",72996d479f7e0317e7041dd692414e34,30a9a66d3e288bb297be3a7a186eea57,"D_0__Bacteria;D_1__Acidobacteria;D_2__Subgroup 6;D_3__uncultured microorganism;D_4__uncultured microorganism;D_5__uncultured microorganism;D_6__uncultured microorganism",42236c4d5ee91205a9b5c6c2b60eae1d,c7b238b32c46121c474ce86f91525971,"D_0__Bacteria;D_1__Actinobacteria;D_2__Acidimicrobiia;D_3__Microtrichales;D_4__uncultured;D_5__bacterium YC-ZSS-LKJ199","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Actinomycetales;D_4__Actinomycetaceae;D_5__Actinomyces","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium 1","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Dietziaceae;D_5__Dietzia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Mycobacteriaceae;D_5__Mycobacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Nocardiaceae;D_5__Rhodococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Blastococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Geodermatophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae;D_5__Kineococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae;D_5__uncultured bacterium;D_6__uncultured bacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Brevibacteriaceae;D_5__Spelaeicoccus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Cellulomonadaceae;D_5__Cellulomonas","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Dermabacteraceae;D_5__Brachybacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Dermacoccaceae;D_5__Kytococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Microbacteriaceae;D_5__Amnibacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Arthrobacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Enteractinococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Kocuria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Micrococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Nesterenkonia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Ruaniaceae;D_5__Ruania;D_6__uncultured bacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micromonosporales;D_4__Micromonosporaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Aeromicrobium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Marmoricola","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Nocardioides","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinokineospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinomycetospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Pseudonocardia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Saccharomonospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptomycetales;D_4__Streptomycetaceae;D_5__Streptomyces","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptomycetales;D_4__Streptomycetaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptosporangiales;D_4__Thermomonosporaceae;D_5__Actinomadura","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptosporangiales;D_4__Thermomonosporaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria","D_0__Bacteria;D_1__Actinobacteria;D_2__Coriobacteriia;D_3__Coriobacteriales;D_4__Atopobiaceae;D_5__Atopobium","D_0__Bacteria;D_1__Actinobacteria;D_2__Coriobacteriia;D_3__Coriobacteriales;D_4__Coriobacteriales Incertae Sedis;D_5__Raoultibacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Rubrobacteria;D_3__Rubrobacterales;D_4__Rubrobacteriaceae;D_5__Rubrobacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Thermoleophilia;D_3__Solirubrobacterales;D_4__67-14;D_5__uncultured actinobacterium;D_6__uncultured actinobacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Thermoleophilia;D_3__Solirubrobacterales;D_4__Solirubrobacteraceae;D_5__JCM 18997","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales;D_4__Dysgonomonadaceae;D_5__uncultured","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales;D_4__Prevotellaceae;D_5__Prevotella","2c6f130fa2e53d9e19ebd4379dd7cc7a","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae;D_5__Flavisolibacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Hymenobacteraceae;D_5__Hymenobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Hymenobacteraceae;D_5__Pontibacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Spirosomaceae;D_5__Nibrella;D_6__uncultured bacterium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae;D_5__Capnocytophaga","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae;D_5__Salinimicrobium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Weeksellaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Sphingobacteriales;D_4__Sphingobacteriaceae;D_5__Pedobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Sphingobacteriales;D_4__Sphingobacteriaceae;D_5__Sphingobacterium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Ignavibacteria;D_3__OPB56;D_4__Bacteroidetes bacterium enrichment culture clone phylotype P11;D_5__Bacteroidetes bacterium enrichment culture clone phylotype P11;D_6__Bacteroidetes bacterium enrichment culture clone phylotype P11","D_0__Bacteria;D_1__Bacteroidetes;D_2__Rhodothermia;D_3__Balneolales;D_4__Balneolaceae;D_5__uncultured","D_0__Bacteria;D_1__Bacteroidetes;D_2__Rhodothermia;D_3__Balneolales;D_4__Balneolaceae","D_0__Bacteria;D_1__Chlamydiae;D_2__Chlamydiae;D_3__Chlamydiales;D_4__Parachlamydiaceae","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Thermomicrobiales;D_4__AKYG1722","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Thermomicrobiales;D_4__JG30-KF-CM45","D_0__Bacteria;D_1__Chloroflexi;D_2__Gitt-GS-136;D_3__uncultured Chloroflexi bacterium;D_4__uncultured Chloroflexi bacterium;D_5__uncultured Chloroflexi bacterium;D_6__uncultured Chloroflexi bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Chloroplast",8b95f52a5c3e4c6d10ba9708376ea071,"D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Nostocaceae;D_5__Scytonema UTEX 2349","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Deinococcaceae;D_5__Deinococcus","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Trueperaceae;D_5__Truepera","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Thermales;D_4__Thermaceae;D_5__Meiothermus","D_0__Bacteria;D_1__Epsilonbacteraeota;D_2__Campylobacteria;D_3__Campylobacterales;D_4__Arcobacteraceae;D_5__Arcobacter","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Alicyclobacillaceae;D_5__Effusibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Alicyclobacillaceae;D_5__Tumebacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Anoxybacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Bacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Lentibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Natribacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Oceanobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Pseudogracilibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Virgibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Family XI;D_5__Gemella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae;D_5__Ammoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae;D_5__Cohnella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Planococcaceae;D_5__Lysinibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Sporolactobacillaceae;D_5__uncultured","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Jeotgalicoccus",6ee49e1e27ec45c7951d92b3fbddf9fb,"D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Salinicoccus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Staphylococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Thermoactinomycetaceae;D_5__Novibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Carnobacteriaceae;D_5__Atopostipes","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae;D_5__Enterococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Lactobacillaceae;D_5__Lactobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Leuconostocaceae;D_5__Weissella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Lactococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Streptococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Clostridiaceae 1;D_5__Candidatus Arthromitus;D_6__Candidatus Arthromitus sp. SFB-rat-Yit","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Clostridiaceae 1;D_5__Clostridium sensu stricto 1","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Anaerococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Peptoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Tissierella","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Anaerostipes","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Blautia","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Clostridioides","D_0__Bacteria;D_1__Firmicutes;D_2__Limnochordia;D_3__Limnochordales;D_4__Limnochordaceae;D_5__uncultured bacterium;D_6__uncultured bacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Negativicutes;D_3__Selenomonadales;D_4__Veillonellaceae;D_5__Veillonella","D_0__Bacteria;D_1__Fusobacteria;D_2__Fusobacteriia;D_3__Fusobacteriales;D_4__Fusobacteriaceae;D_5__Fusobacterium","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__BD2-11 terrestrial group;D_3__uncultured soil bacterium;D_4__uncultured soil bacterium;D_5__uncultured soil bacterium;D_6__uncultured soil bacterium","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__Gemmatimonas","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__uncultured","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Longimicrobia;D_3__Longimicrobiales;D_4__Longimicrobiaceae;D_5__uncultured Gemmatimonadetes bacterium;D_6__uncultured Gemmatimonadetes bacterium","D_0__Bacteria;D_1__Patescibacteria;D_2__Saccharimonadia;D_3__Saccharimonadales;D_4__bacterium LWQ8;D_5__bacterium LWQ8;D_6__bacterium LWQ8","D_0__Bacteria;D_1__Planctomycetes;D_2__Phycisphaerae;D_3__Phycisphaerales;D_4__Phycisphaeraceae;D_5__uncultured","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Gemmatales;D_4__Gemmataceae;D_5__Zavarzinella","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Isosphaerales;D_4__Isosphaeraceae;D_5__uncultured","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Pirellulales;D_4__Pirellulaceae;D_5__Bythopirellula","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Planctomycetales;D_4__uncultured;D_5__uncultured Planctomyces sp.","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Skermanella","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Brevundimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Phenylobacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__1174-901-12","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__Microvirga","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae;D_5__Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Bradyrhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Paracoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Rubellimicrobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria;D_5__Pyronema omphalodes","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria;D_5__Zasmidium cellare","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Blastomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingoaurantiacus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Tistrellales;D_4__Geminicoccaceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__Bdellovibrio","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bradymonadales;D_4__Bradymonadaceae;D_5__Bradymonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__SAR324 clade(Marine group B)","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Acidithiobacillales;D_4__Acidithiobacillaceae;D_5__9M32","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Aeromonadales;D_4__Aeromonadaceae;D_5__Aeromonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Alteromonadales;D_4__Shewanellaceae;D_5__Shewanella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Hydrogenophaga","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Lautropia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Massilia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Tepidimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Hydrogenophilaceae;D_5__Hydrogenophilus","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Alysiella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Kingella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Neisseria","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Escherichia-Shigella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Serratia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Nitrococcales;D_4__Nitrococcaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Nitrosococcales;D_4__Nitrosococcaceae;D_5__Nitrosococcus","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Alcanivoracaceae;D_5__Alcanivorax","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Halomonadaceae;D_5__Halomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pasteurellales;D_4__Pasteurellaceae;D_5__Mannheimia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pasteurellales;D_4__Pasteurellaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Acinetobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Enhydrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Psychrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Pseudomonadaceae;D_5__Pseudomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Salinisphaerales;D_4__Salinisphaeraceae;D_5__Salinisphaera","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae;D_5__Chujaibacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae;D_5__Pseudofulvimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Lysobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Pseudoxanthomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria","D_0__Bacteria;D_1__Proteobacteria","D_0__Bacteria;D_1__Spirochaetes;D_2__Spirochaetia;D_3__Spirochaetales;D_4__Spirochaetaceae;D_5__Treponema 2","D_0__Bacteria;D_1__Tenericutes;D_2__Mollicutes;D_3__Mycoplasmatales;D_4__Mycoplasmataceae;D_5__Mycoplasma","D_0__Bacteria;D_1__Verrucomicrobia;D_2__Verrucomicrobiae;D_3__Chthoniobacterales;D_4__Chthoniobacteraceae;D_5__Chthoniobacter","D_0__Bacteria;D_1__Verrucomicrobia;D_2__Verrucomicrobiae;D_3__Pedosphaerales;D_4__Pedosphaeraceae","D_0__Bacteria" \
+#  --o-filtered-sequences rep-seqs-filtered_SwabNeg.qza
+
+qiime taxa filter-seqs \
+  --i-sequences rep-seqs-filtered_knownContam.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-exclude "D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Hydrogenophilaceae;D_5__Hydrogenophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium 1","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Blastococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Geodermatophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Kocuria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Micrococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Sanguibacteraceae;D_5__Sanguibacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Nocardioides","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinomycetospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Rubrobacteria;D_3__Rubrobacterales;D_4__Rubrobacteriaceae;D_5__Rubrobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae;D_5__Cnuella","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Spirosomaceae;D_5__Rhabdobacter","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Chloroflexales;D_4__Roseiflexaceae;D_5__Roseiflexus","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Chroococcidiopsaceae;D_5__Aliterella CENA595","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Chroococcidiopsaceae;D_5__Chroococcidiopsis SAG 2023","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__uncultured;D_5__uncultured bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Sericytochromatia;D_3__uncultured bacterium;D_4__uncultured bacterium;D_5__uncultured bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Sericytochromatia;D_3__uncultured cyanobacterium;D_4__uncultured cyanobacterium;D_5__uncultured cyanobacterium","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Deinococcaceae;D_5__Deinococcus","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Trueperaceae;D_5__Truepera","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Thermales;D_4__Thermaceae;D_5__Meiothermus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Bacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Virgibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Family XII;D_5__Exiguobacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Listeriaceae;D_5__Listeria","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Planococcaceae;D_5__Lysinibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Sporolactobacillaceae;D_5__uncultured","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Staphylococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Aerococcaceae;D_5__Aerococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae;D_5__Enterococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Lactobacillaceae;D_5__Lactobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Streptococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Finegoldia","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Parvimonas","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Peptoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XIII;D_5__Mogibacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Catonella","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__[Ruminococcus] gnavus group","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Clostridioides","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Romboutsia","D_0__Bacteria;D_1__Firmicutes;D_2__Negativicutes;D_3__Selenomonadales;D_4__Veillonellaceae;D_5__Selenomonas","D_0__Bacteria;D_1__Fusobacteria;D_2__Fusobacteriia;D_3__Fusobacteriales;D_4__Leptotrichiaceae;D_5__Leptotrichia","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__Gemmatimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae;D_5__Muricoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae;D_5__Roseomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Azospirillum","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Azospirillum sp. MIMtkN9","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Rhodocista sp. SCSIO 13435","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Brevundimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Caulobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Phenylobacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__Salinarimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Devosiaceae;D_5__Devosia","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Pleomorphomonadaceae;D_5__Chthonobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae;D_5__Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Azorhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Bradyrhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Paracoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Rubellimicrobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodospirillales;D_4__uncultured;D_5__uncultured soil bacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Blastomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Porphyrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Qipengyuania","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bacteriovoracaceae;D_5__Peredibacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__Bdellovibrio","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__OM27 clade","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Alteromonadales;D_4__Alteromonadaceae;D_5__Rheinheimera","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Acidovorax","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Aquabacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Hydrogenophaga","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Massilia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Noviherbaspirillum","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Escherichia-Shigella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Halomonadaceae;D_5__Halomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Acinetobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Enhydrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Lysobacter","D_0__Bacteria;D_1__Patescibacteria;D_2__Gracilibacteria;D_3__Gracilibacteria bacterium oral taxon 873;D_4__Gracilibacteria bacterium oral taxon 873;D_5__Gracilibacteria bacterium oral taxon 873","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Prauserella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Legionellales;D_4__Legionellaceae;D_5__Legionella" \
+  --o-filtered-sequences rep-seqs-filtered.qza
+
+#Some of the contaminant taxa must be eliminated using --p-mode exact, where you give the taxa plugin the exact taxon id. 
+#Use this in cases where you only want to eliminate specific sequences that have overlapping taxon IDs
+#with other non-contaminant groups. To get the exact taxon ID use the tabulated taxonomy_unfiltered.qzv:
+
+qiime taxa filter-seqs \
+  --i-sequences rep-seqs-filtered.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-mode exact \
+  --p-exclude "D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria","D_0__Bacteria;D_1__Proteobacteria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae" \
+  --o-filtered-sequences rep-seqs-filtered_exact.qza
+
+#Make sure all mitochondria and chloroplasts and Archaea are removed from dataset and remove anything that isn't ID'd to phylum.
+
+qiime taxa filter-seqs \
+  --i-sequences rep-seqs-filtered_exact.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza\
+  --p-include D_1 \
+  --p-exclude mitochondria,chloroplast,Archaea \
+  --o-filtered-sequences rep-seqs-filtered_exact_mtclar.qza
+
+#Filter the contaminant taxa out of feature table using the --p-exclude commands as in the rep-seqs filtering above:
+
+qiime taxa filter-table \
+  --i-table table.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-exclude Actinomyces,Corynebacterium,Arthrobacter,Rothia,Propionibacterium,Atopobium,Sediminibacterium,Porphyromonas,Prevotella,Chryseobacterium,Capnocytophaga,Chryseobacterium,Flavobacterium,Pedobacter,UnclassifiedTM7,Bacillus,Geobacillus,Brevibacillus,Paenibacillus,Staphylococcus,Abiotrophia,Granulicatella,Enterococcus,Lactobacillus,Streptococcus,Clostridium,Coprococcus,Anaerococcus,Dialister,Megasphaera,Veillonella,Fusobacterium,Leptotrichia,Brevundimonas,Afipia,Bradyrhizobium,Devosia,Methylobacterium,Mesorhizobium,Phyllobacterium,Rhizobium,Methylobacterium,Phyllobacterium,Roseomonas,Novosphingobium,Sphingobium,Sphingomonas,Achromobacter,Burkholderia,Acidovorax,Comamonas,Curvibacter,Pelomonas,Cupriavidus,Duganella,Herbaspirillum,Janthinobacterium,Massilia,Oxalobacter,Ralstonia,Leptothrix,kingella,Neisseria,Escherichia,Haemophilus,Acinetobacter,Enhydrobacter,Pseudomonas,Stenotrophomonas,Xanthomonas \
+  --o-filtered-table table-filtered_knownContam.qza
+
+#qiime taxa filter-table \
+#  --i-table table-filtered_knownContam.qza \
+#  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+#  --p-mode exact \
+#  --p-exclude "D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales","D_0__Bacteria;D_1__Acidobacteria;D_2__Blastocatellia (Subgroup 4);D_3__Blastocatellales;D_4__Blastocatellacea",72996d479f7e0317e7041dd692414e34,30a9a66d3e288bb297be3a7a186eea57,"D_0__Bacteria;D_1__Acidobacteria;D_2__Subgroup 6;D_3__uncultured microorganism;D_4__uncultured microorganism;D_5__uncultured microorganism;D_6__uncultured microorganism",42236c4d5ee91205a9b5c6c2b60eae1d,c7b238b32c46121c474ce86f91525971,"D_0__Bacteria;D_1__Actinobacteria;D_2__Acidimicrobiia;D_3__Microtrichales;D_4__uncultured;D_5__bacterium YC-ZSS-LKJ199","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Actinomycetales;D_4__Actinomycetaceae;D_5__Actinomyces","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium 1","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Dietziaceae;D_5__Dietzia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Mycobacteriaceae;D_5__Mycobacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Nocardiaceae;D_5__Rhodococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Blastococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Geodermatophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae;D_5__Kineococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae;D_5__uncultured bacterium;D_6__uncultured bacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Kineosporiales;D_4__Kineosporiaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Brevibacteriaceae;D_5__Spelaeicoccus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Cellulomonadaceae;D_5__Cellulomonas","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Dermabacteraceae;D_5__Brachybacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Dermacoccaceae;D_5__Kytococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Microbacteriaceae;D_5__Amnibacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Arthrobacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Enteractinococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Kocuria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Micrococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Nesterenkonia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Ruaniaceae;D_5__Ruania;D_6__uncultured bacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micromonosporales;D_4__Micromonosporaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Aeromicrobium","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Marmoricola","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Nocardioides","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinokineospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinomycetospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Pseudonocardia","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Saccharomonospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptomycetales;D_4__Streptomycetaceae;D_5__Streptomyces","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptomycetales;D_4__Streptomycetaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptosporangiales;D_4__Thermomonosporaceae;D_5__Actinomadura","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Streptosporangiales;D_4__Thermomonosporaceae","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria","D_0__Bacteria;D_1__Actinobacteria;D_2__Coriobacteriia;D_3__Coriobacteriales;D_4__Atopobiaceae;D_5__Atopobium","D_0__Bacteria;D_1__Actinobacteria;D_2__Coriobacteriia;D_3__Coriobacteriales;D_4__Coriobacteriales Incertae Sedis;D_5__Raoultibacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Rubrobacteria;D_3__Rubrobacterales;D_4__Rubrobacteriaceae;D_5__Rubrobacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Thermoleophilia;D_3__Solirubrobacterales;D_4__67-14;D_5__uncultured actinobacterium;D_6__uncultured actinobacterium","D_0__Bacteria;D_1__Actinobacteria;D_2__Thermoleophilia;D_3__Solirubrobacterales;D_4__Solirubrobacteraceae;D_5__JCM 18997","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales;D_4__Dysgonomonadaceae;D_5__uncultured","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Bacteroidales;D_4__Prevotellaceae;D_5__Prevotella","2c6f130fa2e53d9e19ebd4379dd7cc7a","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae;D_5__Flavisolibacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Hymenobacteraceae;D_5__Hymenobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Hymenobacteraceae;D_5__Pontibacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Spirosomaceae;D_5__Nibrella;D_6__uncultured bacterium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae;D_5__Capnocytophaga","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae;D_5__Salinimicrobium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Flavobacteriaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales;D_4__Weeksellaceae","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Flavobacteriales","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Sphingobacteriales;D_4__Sphingobacteriaceae;D_5__Pedobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Sphingobacteriales;D_4__Sphingobacteriaceae;D_5__Sphingobacterium","D_0__Bacteria;D_1__Bacteroidetes;D_2__Ignavibacteria;D_3__OPB56;D_4__Bacteroidetes bacterium enrichment culture clone phylotype P11;D_5__Bacteroidetes bacterium enrichment culture clone phylotype P11;D_6__Bacteroidetes bacterium enrichment culture clone phylotype P11","D_0__Bacteria;D_1__Bacteroidetes;D_2__Rhodothermia;D_3__Balneolales;D_4__Balneolaceae;D_5__uncultured","D_0__Bacteria;D_1__Bacteroidetes;D_2__Rhodothermia;D_3__Balneolales;D_4__Balneolaceae","D_0__Bacteria;D_1__Chlamydiae;D_2__Chlamydiae;D_3__Chlamydiales;D_4__Parachlamydiaceae","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Thermomicrobiales;D_4__AKYG1722","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Thermomicrobiales;D_4__JG30-KF-CM45","D_0__Bacteria;D_1__Chloroflexi;D_2__Gitt-GS-136;D_3__uncultured Chloroflexi bacterium;D_4__uncultured Chloroflexi bacterium;D_5__uncultured Chloroflexi bacterium;D_6__uncultured Chloroflexi bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Chloroplast",8b95f52a5c3e4c6d10ba9708376ea071,"D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Nostocaceae;D_5__Scytonema UTEX 2349","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Deinococcaceae;D_5__Deinococcus","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Trueperaceae;D_5__Truepera","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Thermales;D_4__Thermaceae;D_5__Meiothermus","D_0__Bacteria;D_1__Epsilonbacteraeota;D_2__Campylobacteria;D_3__Campylobacterales;D_4__Arcobacteraceae;D_5__Arcobacter","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Alicyclobacillaceae;D_5__Effusibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Alicyclobacillaceae;D_5__Tumebacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Anoxybacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Bacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Lentibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Natribacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Oceanobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Pseudogracilibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Virgibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Family XI;D_5__Gemella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae;D_5__Ammoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae;D_5__Cohnella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Paenibacillaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Planococcaceae;D_5__Lysinibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Sporolactobacillaceae;D_5__uncultured","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Jeotgalicoccus",6ee49e1e27ec45c7951d92b3fbddf9fb,"D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Salinicoccus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Staphylococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Thermoactinomycetaceae;D_5__Novibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Carnobacteriaceae;D_5__Atopostipes","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae;D_5__Enterococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Lactobacillaceae;D_5__Lactobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Leuconostocaceae;D_5__Weissella","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Lactococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Streptococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Clostridiaceae 1;D_5__Candidatus Arthromitus;D_6__Candidatus Arthromitus sp. SFB-rat-Yit","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Clostridiaceae 1;D_5__Clostridium sensu stricto 1","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Anaerococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Peptoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Tissierella","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Anaerostipes","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Blautia","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Clostridioides","D_0__Bacteria;D_1__Firmicutes;D_2__Limnochordia;D_3__Limnochordales;D_4__Limnochordaceae;D_5__uncultured bacterium;D_6__uncultured bacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Negativicutes;D_3__Selenomonadales;D_4__Veillonellaceae;D_5__Veillonella","D_0__Bacteria;D_1__Fusobacteria;D_2__Fusobacteriia;D_3__Fusobacteriales;D_4__Fusobacteriaceae;D_5__Fusobacterium","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__BD2-11 terrestrial group;D_3__uncultured soil bacterium;D_4__uncultured soil bacterium;D_5__uncultured soil bacterium;D_6__uncultured soil bacterium","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__Gemmatimonas","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__uncultured","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Longimicrobia;D_3__Longimicrobiales;D_4__Longimicrobiaceae;D_5__uncultured Gemmatimonadetes bacterium;D_6__uncultured Gemmatimonadetes bacterium","D_0__Bacteria;D_1__Patescibacteria;D_2__Saccharimonadia;D_3__Saccharimonadales;D_4__bacterium LWQ8;D_5__bacterium LWQ8;D_6__bacterium LWQ8","D_0__Bacteria;D_1__Planctomycetes;D_2__Phycisphaerae;D_3__Phycisphaerales;D_4__Phycisphaeraceae;D_5__uncultured","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Gemmatales;D_4__Gemmataceae;D_5__Zavarzinella","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Isosphaerales;D_4__Isosphaeraceae;D_5__uncultured","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Pirellulales;D_4__Pirellulaceae;D_5__Bythopirellula","D_0__Bacteria;D_1__Planctomycetes;D_2__Planctomycetacia;D_3__Planctomycetales;D_4__uncultured;D_5__uncultured Planctomyces sp.","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Skermanella","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Brevundimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Phenylobacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__1174-901-12","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__Microvirga","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae;D_5__Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Bradyrhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Paracoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Rubellimicrobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria;D_5__Pyronema omphalodes","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria;D_5__Zasmidium cellare","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rickettsiales;D_4__Mitochondria","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Blastomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingoaurantiacus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Tistrellales;D_4__Geminicoccaceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__Bdellovibrio","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bradymonadales;D_4__Bradymonadaceae;D_5__Bradymonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__SAR324 clade(Marine group B)","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Acidithiobacillales;D_4__Acidithiobacillaceae;D_5__9M32","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Aeromonadales;D_4__Aeromonadaceae;D_5__Aeromonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Alteromonadales;D_4__Shewanellaceae;D_5__Shewanella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Hydrogenophaga","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Lautropia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Massilia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Tepidimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Hydrogenophilaceae;D_5__Hydrogenophilus","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Alysiella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Kingella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__Neisseria","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Escherichia-Shigella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Serratia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Nitrococcales;D_4__Nitrococcaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Nitrosococcales;D_4__Nitrosococcaceae;D_5__Nitrosococcus","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Alcanivoracaceae;D_5__Alcanivorax","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Halomonadaceae;D_5__Halomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pasteurellales;D_4__Pasteurellaceae;D_5__Mannheimia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pasteurellales;D_4__Pasteurellaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Acinetobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Enhydrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Psychrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Pseudomonadaceae;D_5__Pseudomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Salinisphaerales;D_4__Salinisphaeraceae;D_5__Salinisphaera","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae;D_5__Chujaibacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae;D_5__Pseudofulvimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Rhodanobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Lysobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Pseudoxanthomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria","D_0__Bacteria;D_1__Proteobacteria","D_0__Bacteria;D_1__Spirochaetes;D_2__Spirochaetia;D_3__Spirochaetales;D_4__Spirochaetaceae;D_5__Treponema 2","D_0__Bacteria;D_1__Tenericutes;D_2__Mollicutes;D_3__Mycoplasmatales;D_4__Mycoplasmataceae;D_5__Mycoplasma","D_0__Bacteria;D_1__Verrucomicrobia;D_2__Verrucomicrobiae;D_3__Chthoniobacterales;D_4__Chthoniobacteraceae;D_5__Chthoniobacter","D_0__Bacteria;D_1__Verrucomicrobia;D_2__Verrucomicrobiae;D_3__Pedosphaerales;D_4__Pedosphaeraceae","D_0__Bacteria" \
+#  --o-filtered-table table-filtered_SwabNeg.qza
+
+qiime taxa filter-table \
+  --i-table table-filtered_knownContam.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-exclude "D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Hydrogenophilaceae;D_5__Hydrogenophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Corynebacteriales;D_4__Corynebacteriaceae;D_5__Corynebacterium 1","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Blastococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__Geodermatophilaceae;D_5__Geodermatophilus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Kocuria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Micrococcaceae;D_5__Micrococcus","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Micrococcales;D_4__Sanguibacteraceae;D_5__Sanguibacter","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Propionibacteriales;D_4__Nocardioidaceae;D_5__Nocardioides","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Actinomycetospora","D_0__Bacteria;D_1__Actinobacteria;D_2__Rubrobacteria;D_3__Rubrobacterales;D_4__Rubrobacteriaceae;D_5__Rubrobacter","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Chitinophagales;D_4__Chitinophagaceae;D_5__Cnuella","D_0__Bacteria;D_1__Bacteroidetes;D_2__Bacteroidia;D_3__Cytophagales;D_4__Spirosomaceae;D_5__Rhabdobacter","D_0__Bacteria;D_1__Chloroflexi;D_2__Chloroflexia;D_3__Chloroflexales;D_4__Roseiflexaceae;D_5__Roseiflexus","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Chroococcidiopsaceae;D_5__Aliterella CENA595","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__Chroococcidiopsaceae;D_5__Chroococcidiopsis SAG 2023","D_0__Bacteria;D_1__Cyanobacteria;D_2__Oxyphotobacteria;D_3__Nostocales;D_4__uncultured;D_5__uncultured bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Sericytochromatia;D_3__uncultured bacterium;D_4__uncultured bacterium;D_5__uncultured bacterium","D_0__Bacteria;D_1__Cyanobacteria;D_2__Sericytochromatia;D_3__uncultured cyanobacterium;D_4__uncultured cyanobacterium;D_5__uncultured cyanobacterium","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Deinococcaceae;D_5__Deinococcus","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Deinococcales;D_4__Trueperaceae;D_5__Truepera","D_0__Bacteria;D_1__Deinococcus-Thermus;D_2__Deinococci;D_3__Thermales;D_4__Thermaceae;D_5__Meiothermus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Bacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Bacillaceae;D_5__Virgibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Family XII;D_5__Exiguobacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Listeriaceae;D_5__Listeria","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Planococcaceae;D_5__Lysinibacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Sporolactobacillaceae;D_5__uncultured","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Bacillales;D_4__Staphylococcaceae;D_5__Staphylococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Aerococcaceae;D_5__Aerococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Enterococcaceae;D_5__Enterococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Lactobacillaceae;D_5__Lactobacillus","D_0__Bacteria;D_1__Firmicutes;D_2__Bacilli;D_3__Lactobacillales;D_4__Streptococcaceae;D_5__Streptococcus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Finegoldia","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Parvimonas","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XI;D_5__Peptoniphilus","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Family XIII;D_5__Mogibacterium","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__Catonella","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Lachnospiraceae;D_5__[Ruminococcus] gnavus group","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Clostridioides","D_0__Bacteria;D_1__Firmicutes;D_2__Clostridia;D_3__Clostridiales;D_4__Peptostreptococcaceae;D_5__Romboutsia","D_0__Bacteria;D_1__Firmicutes;D_2__Negativicutes;D_3__Selenomonadales;D_4__Veillonellaceae;D_5__Selenomonas","D_0__Bacteria;D_1__Fusobacteria;D_2__Fusobacteriia;D_3__Fusobacteriales;D_4__Leptotrichiaceae;D_5__Leptotrichia","D_0__Bacteria;D_1__Gemmatimonadetes;D_2__Gemmatimonadetes;D_3__Gemmatimonadales;D_4__Gemmatimonadaceae;D_5__Gemmatimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae;D_5__Muricoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Acetobacterales;D_4__Acetobacteraceae;D_5__Roseomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Azospirillum","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Azospirillum sp. MIMtkN9","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Azospirillales;D_4__Azospirillaceae;D_5__Rhodocista sp. SCSIO 13435","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Brevundimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Caulobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__Phenylobacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae;D_5__Salinarimonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Devosiaceae;D_5__Devosia","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Pleomorphomonadaceae;D_5__Chthonobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae;D_5__Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Azorhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Xanthobacteraceae;D_5__Bradyrhizobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Paracoccus","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodobacterales;D_4__Rhodobacteraceae;D_5__Rubellimicrobium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhodospirillales;D_4__uncultured;D_5__uncultured soil bacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Blastomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Porphyrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Qipengyuania","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae;D_5__Sphingomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bacteriovoracaceae;D_5__Peredibacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__Bdellovibrio","D_0__Bacteria;D_1__Proteobacteria;D_2__Deltaproteobacteria;D_3__Bdellovibrionales;D_4__Bdellovibrionaceae;D_5__OM27 clade","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Alteromonadales;D_4__Alteromonadaceae;D_5__Rheinheimera","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Acidovorax","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Aquabacterium","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Hydrogenophaga","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Massilia","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Burkholderiaceae;D_5__Noviherbaspirillum","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Betaproteobacteriales;D_4__Neisseriaceae;D_5__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae;D_5__Escherichia-Shigella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Oceanospirillales;D_4__Halomonadaceae;D_5__Halomonas","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Acinetobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Pseudomonadales;D_4__Moraxellaceae;D_5__Enhydrobacter","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Xanthomonadales;D_4__Xanthomonadaceae;D_5__Lysobacter","D_0__Bacteria;D_1__Patescibacteria;D_2__Gracilibacteria;D_3__Gracilibacteria bacterium oral taxon 873;D_4__Gracilibacteria bacterium oral taxon 873;D_5__Gracilibacteria bacterium oral taxon 873","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Pseudonocardiales;D_4__Pseudonocardiaceae;D_5__Prauserella","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Legionellales;D_4__Legionellaceae;D_5__Legionella" \
+  --o-filtered-table table-filtered.qza
+
+qiime taxa filter-table \
+  --i-table table-filtered.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --p-mode exact \
+  --p-exclude "D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Rhizobiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria","D_0__Bacteria;D_1__Proteobacteria","D_0__Bacteria;D_1__Actinobacteria;D_2__Actinobacteria;D_3__Frankiales;D_4__uncultured","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Sphingomonadales;D_4__Sphingomonadaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Rhizobiales;D_4__Beijerinckiaceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Alphaproteobacteria;D_3__Caulobacterales;D_4__Caulobacteraceae","D_0__Bacteria;D_1__Proteobacteria;D_2__Gammaproteobacteria;D_3__Enterobacteriales;D_4__Enterobacteriaceae" \
+  --o-filtered-table table-filtered_exact.qza
+
+qiime taxa filter-table \
+  --i-table table-filtered_exact.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza\
+  --p-include D_1 \
+  --p-exclude mitochondria,chloroplast,Archaea \
+  --o-filtered-table table-filtered_exact_mtclar.qza
+
+##LOOSE FILTERING ASSUMING BA24 is a swab and using decontam to remove the rest of contaminants
+
+#qiime taxa filter-seqs \
+#  --i-sequences rep-seqs-filtered_knownContam.qza \
+#  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza\
+#  --p-include D_1 \
+#  --p-exclude mitochondria,chloroplast,Archaea \
+#  --o-filtered-sequences rep-seqs-filtered_knownContam_mtclar.qza
+#
+#qiime taxa filter-table \
+#  --i-table table-filtered_knownContam.qza \
+#  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza\
+#  --p-include D_1 \
+#  --p-exclude mitochondria,chloroplast,Archaea \
+#  --o-filtered-table table-filtered_knownContam_mtclar.qza
+
+#In order to verify that all of the contaminant taxa are removed re-make the taxa bar plots and rep-seqs table.
+#It is not necessary to reclassify the taxonomy, because any features that are missing from rep-seqs and the feature
+#table will be ignored by the unfiltered taxonomy metadata.
+
+qiime taxa barplot \
+  --i-table table-filtered_exact_mtclar.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --m-metadata-file Metadata_Mexico.tsv \
+  --o-visualization taxa-bar-plots_filtered.qzv
+
+qiime feature-table tabulate-seqs \
+  --i-data rep-seqs-filtered_exact_mtclar.qza \
+  --o-visualization filtered_rep-seqs.qzv
+
+#Copy these to laptop for viewing in QIIME2View
+
+#Now let's break out the bat fly species only to look for individuals that have high contamination
+qiime feature-table filter-samples \
+  --i-table table-filtered_exact_mtclar.qza \
+  --m-metadata-file Metadata_Mexico.tsv \
+  --p-where "BatFly='Y'" \
+  --o-filtered-table BatFly_table-filtered_exact_mtclar.qza
+
+qiime taxa barplot \
+  --i-table BatFly_table-filtered_exact_mtclar.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --m-metadata-file Metadata_Mexico.tsv \
+  --o-visualization BatFly_taxa-bar-plots_filtered.qzv
+
+#Identify samples not comprised of 40% combined of endosymbiont3, Arsenophonus, Bartonella, and Wolbachia:
+
+#These samples will be removed later if not removed by decontam in R. I want to see if these samples also happen
+#to be these low concentration ones.
+
+#Remove PCR(-), Index(-) and Extraction(-), and (+) controls from file
+
+qiime feature-table filter-samples \
+  --i-table table-filtered_exact_mtclar.qza \
+  --m-metadata-file Metadata_Mexico_Filtered.tsv \
+  --o-filtered-table filtered_table.qza
+
+#Summarize the feature table to build a bar plot for view in QIIME2 Viewer
+
+qiime taxa barplot \
+  --i-table filtered_table.qza \
+  --i-taxonomy taxonomy/taxonomy_NoSpaces.qza \
+  --m-metadata-file Metadata_Mexico_Filtered.tsv \
+  --o-visualization taxa-bar-plots_filtered_NoControls.qzv
+
+#Summarize the filtered feature tables as number of sequences to explore the results of the filtering steps:
+
+qiime feature-table summarize \
+  --i-table filtered_table.qza \
+  --o-visualization table-final_filtered.qzv \
+  --m-sample-metadata-file Metadata_Mexico_Filtered.tsv
+
+#Copy to computer
+
+####BUILD A PHYLOGENY####
+#I did not need to submit the tree-building steps as a job to cuvier. I simply ran them from the terminal.
+#Create an alignment of using mafft of both strictly and loosely filtered data
+#Strict filter
+qiime alignment mafft \
+  --i-sequences rep-seqs-filtered_exact_mtclar.qza \
+  --o-alignment aligned-rep-seqs.qza
+
+#Mask the highly variable positions of the alignment, which are not informative for phylogenetic tree reconstruction:
+#Strict filter
+qiime alignment mask \
+  --i-alignment aligned-rep-seqs.qza \
+  --o-masked-alignment masked-aligned-rep-seqs.qza
+
+#Use FastTree to generate a phylogenetic tree from the masked alignment:
+#Strict filter
+qiime phylogeny fasttree \
+  --i-alignment masked-aligned-rep-seqs.qza \
+  --o-tree unrooted-tree.qza
+
+#Midpoint root the phylogeny
+#Strict filter
+qiime phylogeny midpoint-root \
+  --i-tree unrooted-tree.qza \
+  --o-rooted-tree rooted-tree.qza
+
+#######
+#Loose filter
+#qiime alignment mafft \
+#  --i-sequences rep-seqs-filtered_knownContam_mtclar.qza \
+#  --o-alignment aligned-loose-rep-seqs.qza
+
+#Loose filter
+#qiime alignment mask \
+#  --i-alignment aligned-loose-rep-seqs.qza \
+#  --o-masked-alignment masked-aligned-loose-rep-seqs.qza
+
+#Loose filter
+#qiime phylogeny fasttree \
+#  --i-alignment masked-aligned-loose-rep-seqs.qza \
+#  --o-tree unrooted-loose-tree.qza
+
+#Loose filter
+#qiime phylogeny midpoint-root \
+#  --i-tree unrooted-loose-tree.qza \
+#  --o-rooted-tree rooted-loose-tree.qza
+
+####NORMALIZE DATA USING philr####
+#Use the export function in QIIME2 to export the feature-table as a BIOM v2.1.0 formatted file
+#Followed the directions here: https://github.com/joey711/phyloseq/issues/821
+#Strict filter
+qiime tools export \
+  --input-path filtered_table.qza \
+  --output-path exported-feature-table/
+
+#Convert the exported feature table to a tsv file
+#Strict filter
+cd exported-feature-table
+biom convert -i feature-table.biom -o feature-table.txt --to-tsv
+
+#Open the tsv version of the biom file in nano and change the column header "#OTU ID" to "OTUID", remove
+#all rows before OTUID
+
+#Export the taxonomy file
+#Strict filter
+cd ..
+qiime tools export \
+  --input-path taxonomy/taxonomy_NoSpaces.qza \
+  --output-path exported-feature-table
+
+#Open taxonomy.tsv and change "Feature ID" to "OTUID" to match the label in feature-table.tsv
+
+cd exported-feature-table
+cd exported-feature-table-loose
+
+#Export the representative sequences
+#Strict filter
+cd ..
+qiime tools export \
+  --input-path rep-seqs-filtered_exact_mtclar.qza \
+  --output-path exported-feature-table
+
+#Export the unrooted phylogeny
+#Strict filter
+qiime tools export \
+  --input-path unrooted-tree.qza \
+  --output-path exported-tree-unrooted
+
+
+#Export the rooted phylogeny
+#Strict filter
+qiime tools export \
+  --input-path rooted-tree.qza \
+  --output-path exported-tree-rooted
+
+#Download the exported files to the local computer
+
+#######
+#Loose filter
+cd exported-feature-table-loose
+biom convert -i feature-table.biom -o feature-table.txt --to-tsv
+
+#Loose filter
+cd ..
+qiime tools export \
+  --input-path taxonomy/taxonomy_NoSpaces.qza \
+  --output-path exported-feature-table-loose
+
+#Loose filter
+cd ..
+qiime tools export \
+  --input-path rep-seqs-filtered_knownContam_mtclar.qza \
+  --output-path exported-feature-table-loose
+
+#Loose filter
+qiime tools export \
+  --input-path unrooted-loose-tree.qza \
+  --output-path exported-tree-unrooted-loose
+
+#Loose filter
+qiime tools export \
+  --input-path rooted-loose-tree.qza \
+  --output-path exported-tree-rooted-loose
+
+#In R Studio, use the script /Users/kelly/Documents/WrittenScripts/philrNormalizationofMicrobiomeData.R
+#to upload data into phyloseq and normalize the data using philr.
